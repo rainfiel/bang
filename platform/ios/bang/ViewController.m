@@ -9,17 +9,27 @@
 #import "ViewController.h"
 #import "fw.h"
 #import "liosutil.h"
+#import "Constants.h"
 
+#import <CoreBluetooth/CoreBluetooth.h>
 #import <lua.h>
 #import <lauxlib.h>
+
+#define TIMER_PAUSE_INTERVAL 3.0
+#define TIMER_SCAN_INTERVAL  1.0
+#define SENSOR_TAG_NAME @"iTAG  "
 
 static ViewController* _controller = nil;
 static NSString *appFolderPath = nil;
 
-@interface ViewController () {
+@interface ViewController () <CBCentralManagerDelegate, CBPeripheralDelegate> {
 	int disableGesture;
 }
 @property (strong, nonatomic) EAGLContext *context;
+
+@property (nonatomic, strong) CBCentralManager *centralManager;
+@property (nonatomic, strong) CBPeripheral *sensorTag;
+@property (nonatomic, assign) BOOL keepScanning;
 
 @end
 
@@ -41,6 +51,10 @@ static NSString *appFolderPath = nil;
 }
 
 - (void)viewDidLoad {
+   // Create the CBCentralManager.
+   // NOTE: Creating the CBCentralManager with initWithDelegate will immediately call centralManagerDidUpdateState.
+	self.centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:nil options:nil];
+
 	[super viewDidLoad];
 	[self setGesture ];
 	
@@ -260,4 +274,155 @@ getStateCode(UIGestureRecognizerState state) {
 	}
 }
 
+
+
+#pragma mark - CBCentralManagerDelegate methods
+
+- (void)pauseScan {
+    // Scanning uses up battery on phone, so pause the scan process for the designated interval.
+    NSLog(@"*** PAUSING SCAN...");
+    [NSTimer scheduledTimerWithTimeInterval:TIMER_PAUSE_INTERVAL target:self selector:@selector(resumeScan) userInfo:nil repeats:NO];
+    [self.centralManager stopScan];
+}
+
+- (void)resumeScan {
+    if (self.keepScanning) {
+        // Start scanning again...
+        NSLog(@"*** RESUMING SCAN!");
+        [NSTimer scheduledTimerWithTimeInterval:TIMER_SCAN_INTERVAL target:self selector:@selector(pauseScan) userInfo:nil repeats:NO];
+        [self.centralManager scanForPeripheralsWithServices:nil options:@{CBCentralManagerRestoredStateScanOptionsKey:@(YES)}];    }
+}
+
+- (void)cleanup {
+    [_centralManager cancelPeripheralConnection:self.sensorTag];
+}
+
+- (void)centralManagerDidUpdateState:(CBCentralManager *)central {
+    BOOL showAlert = YES;
+    NSString *state = @"";
+    switch ([central state])
+    {
+        case CBCentralManagerStateUnsupported:
+            state = @"This device does not support Bluetooth Low Energy.";
+            break;
+        case CBCentralManagerStateUnauthorized:
+            state = @"This app is not authorized to use Bluetooth Low Energy.";
+            break;
+        case CBCentralManagerStatePoweredOff:
+            state = @"Bluetooth on this device is currently powered off.";
+            break;
+        case CBCentralManagerStateResetting:
+            state = @"The BLE Manager is resetting; a state update is pending.";
+            break;
+        case CBCentralManagerStatePoweredOn:
+            showAlert = NO;
+            state = @"Bluetooth LE is turned on and ready for communication.";
+            NSLog(@"%@", state);
+            self.keepScanning = YES;
+            [NSTimer scheduledTimerWithTimeInterval:TIMER_SCAN_INTERVAL target:self selector:@selector(pauseScan) userInfo:nil repeats:NO];
+            [self.centralManager scanForPeripheralsWithServices:nil options:nil];
+            break;
+        case CBCentralManagerStateUnknown:
+            state = @"The state of the BLE Manager is unknown.";
+            break;
+        default:
+            state = @"The state of the BLE Manager is unknown.";
+    }
+    
+    if (showAlert) {
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Central Manager State" message:state preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil];
+        [ac addAction:okAction];
+        [self presentViewController:ac animated:YES completion:nil];
+    }
+    
+}
+
+- (void)centralManager:(CBCentralManager *)central didDiscoverPeripheral:(CBPeripheral *)peripheral advertisementData:(NSDictionary *)advertisementData RSSI:(NSNumber *)RSSI {
+    // Retrieve the peripheral name from the advertisement data using the "kCBAdvDataLocalName" key
+    NSString *peripheralName = [advertisementData objectForKey:CBAdvertisementDataLocalNameKey];
+    NSLog(@"NEXT PERIPHERAL: %@ %@ (%@) %@", peripheralName, peripheral.name, peripheral.identifier.UUIDString, RSSI);
+    //NSLog(@"NEXT PERIPHERAL: %@ (%@)", peripheral.name, peripheral.identifier.UUIDString);
+    if (peripheralName) {
+        if ([peripheralName isEqualToString:SENSOR_TAG_NAME]) {
+          NSLog(@".........................connect");
+            self.keepScanning = NO;
+            
+            // save a reference to the sensor tag
+            self.sensorTag = peripheral;
+            self.sensorTag.delegate = self;
+            
+            // Request a connection to the peripheral
+            [self.centralManager connectPeripheral:self.sensorTag options:nil];
+        }
+    }
+}
+
+- (void)centralManager:(CBCentralManager *)central didConnectPeripheral:(CBPeripheral *)peripheral {
+    NSLog(@"**** SUCCESSFULLY CONNECTED TO SENSOR TAG!!!");
+    // Now that we've successfully connected to the SensorTag, let's discover the services.
+    // - NOTE:  we pass nil here to request ALL services be discovered.
+    //          If there was a subset of services we were interested in, we could pass the UUIDs here.
+    //          Doing so saves batter life and saves time.
+    ejoy2d_fw_message(-2, "connect", nil, 0);
+    [peripheral discoverServices:nil];
+}
+
+- (void)centralManager:(CBCentralManager *)central didFailToConnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
+    NSLog(@"**** CONNECTION FAILED!!!");
+}
+
+- (void)centralManager:(CBCentralManager *)central didDisconnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
+    NSLog(@"**** DISCONNECTED FROM SENSOR TAG!!!");
+}
+
+
+#pragma mark - CBPeripheralDelegate methods
+
+// When the specified services are discovered, the peripheral calls the peripheral:didDiscoverServices: method of its delegate object.
+- (void)peripheral:(CBPeripheral *)peripheral didDiscoverServices:(NSError *)error {
+    // Core Bluetooth creates an array of CBService objects —- one for each service that is discovered on the peripheral.
+    for (CBService *service in peripheral.services) {
+        NSLog(@"Discovered service: %@ %@", service, service.UUID);
+        if (([service.UUID isEqual:[CBUUID UUIDWithString:FIND_ME_SERVICE]])) {
+            [peripheral discoverCharacteristics:nil forService:service];
+        }
+    }
+}
+
+- (void)peripheral:(CBPeripheral *)peripheral didDiscoverCharacteristicsForService:(CBService *)service error:(NSError *)error {
+    for (CBCharacteristic *characteristic in service.characteristics) {
+        uint8_t enableValue = 1;
+        NSData *enableBytes = [NSData dataWithBytes:&enableValue length:sizeof(uint8_t)];
+      
+      	NSLog(@"char UUID:%@", characteristic.UUID);
+
+        if ([characteristic.UUID isEqual:[CBUUID UUIDWithString:FIND_ME_CHARACTERISTIC]]) {
+            [self.sensorTag setNotifyValue:YES forCharacteristic:characteristic];
+        }
+    }
+}
+
+
+- (void)peripheral:(CBPeripheral *)peripheral didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic error:(NSError *)error {
+    if (error) {
+        NSLog(@"Error changing notification state: %@", [error localizedDescription]);
+    } else {
+      
+      if ([characteristic.UUID isEqual:[CBUUID UUIDWithString:FIND_ME_CHARACTERISTIC]]) {
+      	NSLog(@"bang:%@", characteristic.UUID);
+        char* uuid = [characteristic.UUID.UUIDString UTF8String];
+     	 	ejoy2d_fw_message(-2, "click", uuid, 0);
+      }
+
+      
+        // extract the data from the characteristic's value property and display the value based on the characteristic type
+        //NSData *dataBytes = characteristic.value;
+        // if ([characteristic.UUID isEqual:[CBUUID UUIDWithString:UUID_TEMPERATURE_DATA]]) {
+        //     [self displayTemperature:dataBytes];
+        // } else if ([characteristic.UUID isEqual:[CBUUID UUIDWithString:UUID_HUMIDITY_DATA]]) {
+        //     [self displayHumidity:dataBytes];
+        // }
+    }
+}
 @end
